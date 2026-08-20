@@ -1,6 +1,6 @@
 --!nonstrict
 
--- PortableNavigation v2.6 - click to move, with a full settings UI.
+-- PortableNavigation v2.7 - click to move, with trajectory emulation and a full settings UI.
 --
 -- Drop this LocalScript into StarterPlayerScripts, or run it through an
 -- executor. Click the ground to walk there. RightShift opens the settings
