@@ -126,7 +126,11 @@ local NavigationConfig = {
 	Movement = {
 		WaypointReachDistance = 3,
 		LookAheadDistance = 5,
-		JumpCooldown = 0.45,
+		-- These jumps are deliberate rather than spammed, so the cooldown only has
+		-- to stop a double fire on one edge. Long enough and it blocks the next
+		-- gap's jump outright.
+		JumpCooldown = 0.2,
+		HoldAtEdgeForJump = true,
 		JumpCommitWindow = 0.7,
 		HardStopConfirmFrames = 3,
 		StuckDistanceEpsilon = 1.5,
@@ -153,6 +157,13 @@ local NavigationConfig = {
 		GapProbeSamples = 6,
 		ActionReevaluateWindow = 1.4,
 		ArrivalLockDistance = 7,
+		-- A route node is a suggestion about where to be next, not a place that
+		-- has to be visited. Landing past one and turning back to touch it is how
+		-- a jump that overshot turned into a walk backwards off the ledge.
+		SkipAheadNodes = 4,
+		SkipMinGain = 1.5,
+		AirDirectionLock = true,
+		AirDirectionBlend = 0.45,
 		JumpLandingCheckDistances = { 4, 6, 8 },
 	},
 	-- Task 6: Escalating stuck recovery ladder config.
@@ -329,6 +340,7 @@ local NavigationConfig = {
 		SpeedAbsolute = 32,
 		ApplyWalkSpeed = false,
 		WasdThreshold = 0.35,
+		SelfInputWindow = 0.25,
 		WasdBackend = "Auto",
 		FaceMoveDirection = true,
 		TurnSpeed = 720,
@@ -2170,12 +2182,35 @@ function Trajectory:Evaluate(origin: Vector3, direction: Vector3, humanoid, opti
 	-- How much further the character can walk and still have a jump that lands.
 	-- Sampled coarsely: this runs every frame and the answer only needs to be
 	-- right to within a stud or so.
+	-- How much further the character can walk and still have a jump that lands.
+	--
+	-- Every probe point has to be somewhere it could actually be standing. The
+	-- first version simulated a jump from points further along the heading
+	-- without checking there was any floor under them, so on the lip of a gap it
+	-- happily reported several studs of run-up remaining: those points were in
+	-- mid air over the hole, and a jump launched from mid air over the hole does
+	-- of course reach the far side. The follower then held its jump because there
+	-- was "still room", walked off the edge instead, and dropped straight down.
+	-- That is the mid-flight fall, and it is why it only happened sometimes: it
+	-- depended on where the character happened to be when the gap came into view.
 	local margin = 0
 	if jumpSafe then
 		local probeStep = math.max(cfg.MarginStep or 1.5, 0.5)
 		local limit = cfg.MarginLimit or 6
+		local footOffset = profile.FootOffset or (profile.HipHeight + 1)
+		local tolerance = profile.StepTolerance or 1.5
 		while margin < limit do
 			local ahead = origin + direction * (margin + probeStep)
+			local standing = self._detector:FindGroundBelow(
+				ahead + Vector3.new(0, tolerance, 0),
+				0,
+				tolerance * 2 + footOffset
+			)
+			if not standing or math.abs((standing.Y + footOffset) - ahead.Y) > tolerance * 1.5 then
+				-- No floor there. The run-up ends at the edge, not past it.
+				break
+			end
+
 			local later = self:Run(ahead, direction, jumpProfile.JumpVelocity, jumpProfile, {})
 			if not self:LandingIsGood(later, profile) then
 				break
@@ -3188,6 +3223,7 @@ function MovementController.new(character: Model?, obstacleDetector, options)
 	self._jumpEvalFailures = 0
 	self._jumpFailureAt = nil
 	self._jumpHoldSince = nil
+	self._airDirection = nil
 	self._progressAnchor = nil
 	self._progressTime = 0
 	self._stuck = false
@@ -3366,6 +3402,12 @@ function MovementController:_tryJump()
 	self._jumpFailureAt = nil
 	self._jumpHoldSince = nil
 	self._jumpTakeoffY = before
+	-- The heading at take off, but only if there was one. _commandedMove is zero
+	-- whenever the last thing issued was a stop, and a jump out of a stop should
+	-- fall back to whatever the follower computes rather than to nothing.
+	if self._commandedMove and self._commandedMove.Magnitude > 1e-3 then
+		self._airDirection = self._commandedMove
+	end
 	return true
 end
 
@@ -3675,6 +3717,33 @@ function MovementController:Update(dt: number, state)
 	local steeringTarget = state.SteeringTarget
 	local planarOffset = NavUtil.Flatten(steeringTarget - rootPart.Position)
 	local moveDirection = NavUtil.SafeUnit(planarOffset)
+
+	-- Mid air the heading is held at whatever it was on take off. Recomputing it
+	-- every frame swings the command toward whichever node is nearest right now,
+	-- and since a body in flight is usually nearest the node it just left, that
+	-- turn bleeds off the horizontal speed carrying it across the gap. It lands
+	-- short, which is the stutter, and short of a gap is in it.
+	local airborneNow = self:_isAirborne(humanoid)
+	if airborneNow and self._options.Movement.AirDirectionLock ~= false then
+		if not self._airDirection and moveDirection ~= Vector3.zero then
+			self._airDirection = moveDirection
+		end
+		-- Blended, not substituted. Replacing the heading outright measured
+		-- worse than leaving it alone: a Roblox humanoid has real air control and
+		-- the per-frame steering is what lands it accurately, so freezing the
+		-- heading costs more than the carry it preserves. A partial blend keeps
+		-- some of the take off momentum without giving up the correction.
+		--
+		-- Vector3.zero is truthy, which is why this checks a magnitude: a latched
+		-- zero would otherwise command a dead stop in mid air and drop the body
+		-- straight down the gap it was crossing.
+		local blend = math.clamp(tonumber(self._options.Movement.AirDirectionBlend) or 0, 0, 1)
+		if blend > 0 and self._airDirection and self._airDirection.Magnitude > 1e-3 and moveDirection ~= Vector3.zero then
+			moveDirection = NavUtil.SafeUnit(moveDirection:Lerp(self._airDirection, blend))
+		end
+	elseif not airborneNow then
+		self._airDirection = nil
+	end
 	-- Distance to a waypoint is measured on the walking plane, not in three
 	-- dimensions. Pathfinding waypoints sit on the floor while HumanoidRootPart
 	-- rides about three studs above it (HipHeight plus half the root part), so a
@@ -3688,7 +3757,7 @@ function MovementController:Update(dt: number, state)
 	local distanceToWaypoint = flatToWaypoint
 	local withinReach = flatToWaypoint <= self._options.Movement.WaypointReachDistance
 		and verticalToWaypoint <= self._options.Agent.Height
-	local airborne = self:_isAirborne(humanoid)
+	local airborne = airborneNow
 
 	if self._climbState then
 		return self:_updateClimb(dt, waypoint, nil)
@@ -4077,6 +4146,22 @@ function MovementController:Update(dt: number, state)
 			actionDecision.Attempted = self:_tryJump()
 		else
 			actionDecision.Attempted = false
+		end
+
+		-- A required jump that could not be issued must not turn into a walk off
+		-- the edge. _tryJump refuses while its cooldown is running, and on a run
+		-- of ledges that lands squarely on the one stud between "walking off is
+		-- survivable" and "walking off is a fall": the emulator says jump, the
+		-- cooldown says not yet, and nothing stopped the body from strolling into
+		-- the gap. Holding at the lip costs a fraction of a second and the jump
+		-- fires as soon as it can.
+		if not actionDecision.Attempted
+			and flight
+			and not flight.WalkSafe
+			and self._options.Movement.HoldAtEdgeForJump ~= false
+		then
+			self:_move(Vector3.zero)
+			actionDecision.Reason = "held_at_edge"
 		end
 	elseif opportunisticJump then
 		self:_tryJump()
@@ -4732,6 +4817,66 @@ function NavigationController:_getCurrentWaypoint()
 	return self._route.Nodes[self._nextIndex]
 end
 
+-- Route nodes describe a way through, not a set of places that must be touched.
+-- If the character is already meaningfully closer to a node further along, and
+-- it can get there, that is the node to head for. Without this a jump that
+-- overshoots its target turns the character around to walk back onto it, which
+-- on a ledge run means walking back off the ledge.
+function NavigationController:_skipReachedNodes()
+	local route = self._route
+	if not route or not self.RootPart then
+		return
+	end
+
+	local lookAhead = math.floor(self._options.Movement.SkipAheadNodes or 0)
+	if lookAhead <= 0 then
+		return
+	end
+	if self.MovementController:IsAirborne() then
+		return
+	end
+
+	local position = self.RootPart.Position
+	local current = route.Nodes[self._nextIndex]
+	if not current then
+		return
+	end
+
+	local bestIndex = nil
+	local currentDistance = NavUtil.Flatten(current.Position - position).Magnitude
+	local minGain = self._options.Movement.SkipMinGain or 1.5
+	local limit = math.min(#route.Nodes, self._nextIndex + lookAhead)
+	local samples = math.max(1, self._options.PathSmoothing.GroundSamples or 3)
+
+	for index = self._nextIndex + 1, limit do
+		local node = route.Nodes[index]
+
+		-- Never skip over a jump. That node is not a position, it is an
+		-- instruction, and stepping past it means arriving at the far side
+		-- without having done the thing that gets you there.
+		if node.Action == Enum.PathWaypointAction.Jump then
+			break
+		end
+
+		local distance = NavUtil.Flatten(node.Position - position).Magnitude
+		if distance < currentDistance - minGain then
+			-- Walkable from here, on continuous ground. The looser traversal test
+			-- counts a gap as crossable because a route may legitimately jump it,
+			-- which made skipping choose nodes on the far side of a hole and walk
+			-- straight in.
+			if self.ObstacleDetector:CanWalkDirect(position, node.Position, samples) then
+				bestIndex = index
+			end
+		end
+	end
+
+	if bestIndex then
+		self._nextIndex = bestIndex
+		self._pendingAction = nil
+		self.DebugRenderer:DrawPath(route.Nodes, self._nextIndex)
+	end
+end
+
 
 function NavigationController:_shouldBlendSteeringTarget(waypoint, nextNode): boolean
 	if not self.RootPart then
@@ -5002,7 +5147,7 @@ function NavigationController:_step(dt: number)
 		return
 	end
 
-	if not nearGoal and self:_shouldRestartForTargetChange(goalState) then
+	if not nearGoal and not self.MovementController:IsAirborne() and self:_shouldRestartForTargetChange(goalState) then
 		local success = self:_computeFreshRoute(goalState.RawGoal, true, "target_relocated", {
 			AllowRecovery = true,
 		})
@@ -5012,7 +5157,12 @@ function NavigationController:_step(dt: number)
 		plannerGoal = goalState.RawGoal
 	end
 
-	if not nearGoal and self:_shouldReplanForGoal(goalState) then
+	-- Nothing gets replanned while the character is off the ground. A new route
+	-- mid flight retargets the heading, and the heading is what carries the body
+	-- across; the landing is the moment to reconsider, not the arc.
+	local inFlight = self.MovementController:IsAirborne()
+
+	if not nearGoal and not inFlight and self:_shouldReplanForGoal(goalState) then
 		local now = os.clock()
 		if now - self._lastReplanTime >= replanCooldown then
 			local success = self:_computeFreshRoute(plannerGoal, true, if goalState.IsPursuit then "pursuit_drift" else "goal_drift", {
@@ -5060,6 +5210,8 @@ function NavigationController:_step(dt: number)
 	end
 
 	self:_probe(plannerGoal)
+
+	self:_skipReachedNodes()
 
 	local waypoint = self:_getCurrentWaypoint()
 	if not waypoint then
@@ -5371,7 +5523,7 @@ if _G.__PortableNavigationV2 and type(_G.__PortableNavigationV2.Teardown) == "fu
 end
 
 local SCRIPT_NAME = "PortableNavigation"
-local SCRIPT_VERSION = "2.7.0"
+local SCRIPT_VERSION = "2.7.2"
 local SESSION_START = os.clock()
 
 -- ============================================================================
@@ -6649,6 +6801,7 @@ local SCHEMA = {
 					sliderItem("Nav.SpeedAbsolute", "Absolute speed", 4, 250, 1, "Studs per second used when the speed source is Absolute."),
 					toggleItem("Nav.ApplyWalkSpeed", "Write the speed to the humanoid", "Also sets Humanoid.WalkSpeed while a route runs, so Humanoid:Move, MoveTo and WASD go at the chosen speed too. Restored when the route ends. Far more visible to a game than the direct drivers."),
 					{ path = "Nav.WasdBackend", label = "WASD backend", type = "dropdown", options = { "Auto", "keypress", "VirtualInputManager", "VirtualUser" }, desc = "How WASD emulation reaches the game. A plain LocalScript cannot synthesise input at all, so this needs an executor global or VirtualInputManager." },
+					sliderItem("Nav.SelfInputWindow", "Own input window", 0.05, 1, 0.05, "How long a key this script pressed itself is ignored by the manual override watcher. Without it WASD emulation trips the cancel-on-manual-input rule with its own first keystroke and stops the route it is driving."),
 					sliderItem("Nav.WasdThreshold", "WASD key threshold", 0.05, 0.9, 0.05, "How far the direction must lean along a camera axis before that key is held. Lower holds two keys more often and gives smoother diagonals."),
 					toggleItem("Nav.FaceMoveDirection", "Face the movement direction", "The direct drivers turn the character themselves, because writing velocity or CFrame bypasses the humanoid's own AutoRotate and would otherwise leave you sliding sideways."),
 					sliderItem("Nav.TurnSpeed", "Turn speed", 90, 1440, 10, "Degrees per second the character rotates toward the direction of travel."),
@@ -6716,6 +6869,7 @@ local SCHEMA = {
 				title = "Jumping",
 				items = {
 					{ path = "Movement.JumpMethod", label = "Jump method", type = "dropdown", options = { "Both", "ChangeState", "Jump" }, desc = "How a jump is issued. Humanoid.Jump is only a request and some games drop it entirely, leaving the controller convinced it jumped while the character never left the ground. ChangeState performs the jump directly. Both issues each of them." },
+					toggleItem("Movement.HoldAtEdgeForJump", "Hold at the edge for a jump", "When a jump is needed but cannot be issued yet, stop at the lip instead of walking off it. Without this the character strolls into the gap it was about to jump, which is the fall that only happened sometimes."),
 					sliderItem("Movement.JumpCooldown", "Jump cooldown", 0, 3, 0.05, "Minimum seconds between jump attempts."),
 					sliderItem("Movement.JumpCommitWindow", "Jump commit window", 0, 3, 0.05, "How long a jump is treated as still in progress."),
 					sliderItem("Movement.SmallObstacleHeight", "Small obstacle height", 0, 10, 0.1, "Below this a blocker is stepped over rather than jumped."),
@@ -6731,6 +6885,10 @@ local SCHEMA = {
 					sliderItem("Movement.JumpForceAfterFailures", "Force jump after refusals", 0, 10, 1, "After this many consecutive refusals at the same spot the jump is attempted anyway, unless the gap is a genuine fall. Zero disables it and restores the old behaviour of replanning forever."),
 					sliderItem("Movement.JumpSearchStep", "Jump search step", 0.25, 5, 0.05, "Sampling resolution when scanning for a landing."),
 					sliderItem("Movement.ActionReevaluateWindow", "Action reevaluate window", 0.1, 6, 0.05, "How long a pending jump or climb is trusted before re-deciding."),
+					sliderItem("Movement.SkipAheadNodes", "Skip ahead nodes", 0, 12, 1, "How far along the route the follower may look for a node it is already closer to. A jump that overshoots lands past its target, and without this the character turns around to go back and touch it. 0 makes every node compulsory."),
+					sliderItem("Movement.SkipMinGain", "Skip minimum gain", 0, 10, 0.25, "How much closer a later node must be before the follower skips to it, so it does not shuffle between two nodes that are about the same distance away."),
+					toggleItem("Movement.AirDirectionLock", "Blend the take off heading in mid air", "Mixes the direction the character left the ground in into the steering while it is airborne, so a jump keeps some of the momentum that was carrying it across rather than turning toward whichever node is nearest right now."),
+					sliderItem("Movement.AirDirectionBlend", "Air heading blend", 0, 1, 0.05, "0 steers freely in mid air, 1 freezes the take off heading completely. Freezing measured worse than free steering: a Roblox humanoid has real air control and the per-frame correction is what lands it accurately."),
 					sliderItem("Movement.ArrivalLockDistance", "Arrival lock distance", 0, 20, 0.5, "Inside this distance from the goal the controller stops replanning and repairing and simply finishes. Without it the endgame can loop between repair and approach and never settle."),
 				},
 			},
@@ -7584,7 +7742,7 @@ end
 
 local WINDOW_SIZE = Vector2.new(940, 620)
 
-local window = new("Frame", {
+local window = new("CanvasGroup", {
 	Name = "Window",
 	AnchorPoint = Vector2.new(0.5, 0.5),
 	Position = UDim2.fromScale(0.5, 0.5),
@@ -10210,7 +10368,7 @@ end
 UI.WASD_KEYS = { W = 0x57, A = 0x41, S = 0x53, D = 0x44 }
 UI.WASD_ORDER = { "W", "A", "S", "D" }
 
-UI.wasdState = { held = {}, backend = nil, captured = false }
+UI.wasdState = { held = {}, backend = nil, captured = false, selfSent = {} }
 
 local function detectWasdBackend(): string?
 	local preferred = tostring(Config.Get("Nav.WasdBackend"))
@@ -10242,10 +10400,21 @@ local function detectWasdBackend(): string?
 	return nil
 end
 
+-- Synthesised input comes straight back through InputBegan, and the manual
+-- override watcher cannot tell it apart from a person leaning on the keyboard.
+-- So WASD emulation cancelled the route it was driving, on its first step.
+-- Every key this script sends is stamped here and the watcher ignores its own.
 local function setWasdKey(key: string, down: boolean)
 	local backend = UI.wasdState.backend
 	if not backend then
 		return
+	end
+
+	if down then
+		local code = (Enum.KeyCode :: any)[key]
+		if code then
+			UI.wasdState.selfSent[code] = os.clock()
+		end
 	end
 
 	pcall(function()
@@ -10274,6 +10443,7 @@ local function setWasdKey(key: string, down: boolean)
 end
 
 local function releaseWasd()
+	table.clear(UI.wasdState.selfSent)
 	for _, key in ipairs(UI.WASD_ORDER) do
 		if UI.wasdState.held[key] then
 			setWasdKey(key, false)
@@ -10950,7 +11120,12 @@ track(UserInputService.InputBegan:Connect(function(input, gameProcessed)
 			return
 		end
 		if controller and controller.State == "Moving" then
-			if UI.MOVEMENT_KEYS[pressed] and Config.Get("Nav.CancelOnManualInput") == true then
+			local ourOwn = false
+			local sentAt = UI.wasdState.selfSent[pressed]
+			if sentAt and os.clock() - sentAt <= (tonumber(Config.Get("Nav.SelfInputWindow")) or 0.25) then
+				ourOwn = true
+			end
+			if UI.MOVEMENT_KEYS[pressed] and not ourOwn and Config.Get("Nav.CancelOnManualInput") == true then
 				stopNavigation()
 			elseif pressed == Enum.KeyCode.Space and Config.Get("Nav.StopOnJump") == true then
 				stopNavigation()
@@ -11105,10 +11280,10 @@ function setWindowOpen(state: boolean)
 	if state then
 		window.Visible = true
 		window.Size = UDim2.fromOffset(WINDOW_SIZE.X * 0.94, WINDOW_SIZE.Y * 0.94)
-		window.BackgroundTransparency = 1
+		window.GroupTransparency = 1
 		tween(window, {
 			Size = UDim2.fromOffset(WINDOW_SIZE.X, WINDOW_SIZE.Y),
-			BackgroundTransparency = 0,
+			GroupTransparency = 0,
 		}, 0.26, Enum.EasingStyle.Quint)
 		tween(UI.launcher, { Size = UDim2.fromOffset(0, 0), BackgroundTransparency = 1 }, 0.16)
 		task.delay(0.18, function()
@@ -11121,11 +11296,15 @@ function setWindowOpen(state: boolean)
 			tween(UI.blur, { Size = 14 }, 0.3)
 		end
 	else
+		UI.closeMenu()
 		tween(window, {
 			Size = UDim2.fromOffset(WINDOW_SIZE.X * 0.94, WINDOW_SIZE.Y * 0.94),
-			BackgroundTransparency = 1,
-		}, 0.2)
-		task.delay(0.22, function()
+			GroupTransparency = 1,
+		}, 0.22)
+		-- Hidden only once the fade has finished, and a CanvasGroup renders its
+		-- children to a texture every frame, so leaving it visible while closed
+		-- would be paying for a window nobody is looking at.
+		task.delay(0.26, function()
 			if not UI.windowOpen then
 				window.Visible = false
 			end
